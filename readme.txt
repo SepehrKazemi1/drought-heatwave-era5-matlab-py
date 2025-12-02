@@ -25,6 +25,6 @@ I needed a workflow that I can re run when I fix data issues or change threshold
 
 - Hard-coded for my study area (central Iran).
 - Error handling is minimal.
-- Some variable names are in Persian because that’s how I first wrote them 🙂
+- Some variable names are in Persian because thats how I wrote them 
 
 I’ll clean this up more as I go through my thesis.
