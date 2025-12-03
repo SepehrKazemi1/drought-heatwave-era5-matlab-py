@@ -1,6 +1,6 @@
 %%CRU monthly pdfs by quadrant (prc/pet/tmin/tmax) values in mm/month for prc and pet
 clc; clear; close all;
-
+% you should use .nc raw cru files from https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.09/
 dirCRU = "C:\Users\Asus\Desktop\CRU_REFINED";
 outDir = "";
 varsUser = {'prc','pet','tmin','tmax'};
