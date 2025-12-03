@@ -1,0 +1,211 @@
+var region = ee.Geometry.Rectangle([49.95, 31.11, 53.45, 33.78]); 
+var startYear = 1980, endYear = 2024;
+var baseStart = 1980, baseEnd = 2010;
+var K = 12;                          // accumulation months (SPI12 / SPEI12)
+var exportScale = 10000;            // 10 km
+var driveFolder = 'Dyn';
+
+var era5D = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR');
+
+// rename daily bands to consistent 'tp' (precip) and 'pet' (potential evap)
+function renameDaily(img){
+  var b = img.bandNames();
+  var tp = ee.Image(ee.Algorithms.If(
+    b.contains('total_precipitation_sum'),
+    img.select('total_precipitation_sum'),
+    ee.Algorithms.If(
+      b.contains('total_precipitation'),
+      img.select('total_precipitation'),
+      ee.Image(0) // if missing
+    )
+  )).rename('tp');
+  var pet = ee.Image(ee.Algorithms.If(
+    b.contains('potential_evaporation_sum'),
+    img.select('potential_evaporation_sum'),
+    ee.Algorithms.If(
+      b.contains('potential_evaporation'),
+      img.select('potential_evaporation'),
+      ee.Image(0)
+    )
+  )).rename('pet');
+  return tp.addBands(pet).copyProperties(img, ['system:time_start']);
+}
+
+//monthly series//
+function monthlySeries(y0, y1){
+  var start = ee.Date.fromYMD(ee.Number(y0).toInt(), 1, 1);
+  var end   = ee.Date.fromYMD(ee.Number(y1).toInt().add(1), 1, 1);
+  var daily = era5D.filterDate(start, end).map(renameDaily);
+
+  var nMonths = end.difference(start, 'month').toInt();
+  var idxList = ee.List.sequence(0, nMonths.subtract(1));
+
+  var ic = ee.ImageCollection(idxList.map(function(k){
+    k = ee.Number(k);
+    var mStart = start.advance(k, 'month');
+    var mEnd   = mStart.advance(1, 'month');
+    var sum = daily.filterDate(mStart, mEnd).sum().clip(region);
+    // Convert m -> mm
+    var Pmm  = sum.select('tp').multiply(1000).rename('P_mm');
+    var PETmm= sum.select('pet').multiply(1000).rename('PET_mm');
+    return ee.Image.cat([Pmm, PETmm])
+      .set({
+        'system:time_start': mStart.millis(),
+        'year': mStart.get('year'),
+        'month': mStart.get('month'),
+        'idx': k
+      });
+  }));
+  return ic;
+}
+
+var monAll = monthlySeries(startYear, endYear);
+
+/*kmonth accumulation*/
+
+function accK(ic, band, k){
+  var L = ic.toList(ic.size());
+  var n = L.size();
+
+  var out = ee.ImageCollection(ee.List.sequence(0, n.subtract(1)).map(function(i){
+    i = ee.Number(i);
+    var acc = ee.Image(0).rename('accK').clip(region);
+
+    // sum current and previous k-1 months (when available)
+    for (var j = 0; j < k; j++){
+      var idx = i.subtract(j);
+      acc = ee.Image(ee.Algorithms.If(
+        idx.gte(0),
+        acc.add(ee.Image(L.get(idx)).select(band)),
+        acc
+      ));
+    }
+
+    var im0 = ee.Image(L.get(i));
+    return acc.rename('accK')
+      .set({
+        'system:time_start': im0.get('system:time_start'),
+        'year': im0.get('year'),
+        'month': im0.get('month'),
+        'idx': im0.get('idx')
+      });
+  }));
+
+  // first (k-1) months dont have full accumulation so drop them
+  return out.filter(ee.Filter.gte('idx', K - 1));
+}
+
+// 3month precipitation & pet accumulations
+var Pk  = accK(monAll, 'P_mm',  K);
+var PETk= accK(monAll, 'PET_mm',K);
+
+// join by month index to make water balance (P - pet)
+var joinIdx = ee.Join.saveFirst('pet');
+var byIdx   = ee.Filter.equals({leftField:'idx', rightField:'idx'});
+var joined  = ee.ImageCollection(joinIdx.apply(Pk, PETk, byIdx));
+
+var WBk = joined.map(function(img){
+  var pet = ee.Image(img.get('pet')).select('accK');
+  var wb  = ee.Image(img).select('accK').subtract(pet).rename('accK');
+  return wb.copyProperties(img, ['system:time_start','year','month','idx']);
+});
+
+/*baseline monthly stats*/
+function subsetYears(ic, y0, y1){
+  return ic.filter(ee.Filter.gte('year', y0))
+           .filter(ee.Filter.lte('year', y1));
+}
+
+function monthlyStats(ic){  // expects band 'accK'
+  var months = ee.List.sequence(1, 12);
+  return ee.ImageCollection(months.map(function(m){
+    var sub = ic.filter(ee.Filter.eq('month', m));
+    var mean = sub.select('accK').mean().rename('mean');
+    var std  = sub.select('accK').reduce(ee.Reducer.stdDev()).rename('std');
+    var stdSafe = std.where(std.eq(0), 1);           // avoid divide by zero
+    return ee.Image.cat([mean, stdSafe]).set('month', m);
+  }));
+}
+
+var Pk_base  = subsetYears(Pk,  baseStart, baseEnd);
+var WBk_base = subsetYears(WBk, baseStart, baseEnd);
+
+var statsP  = monthlyStats(Pk_base);
+var statsWB = monthlyStats(WBk_base);
+
+/*SPI and SPEI z per month*/
+function standardize(ic, stats, outName){
+  var j = ee.Join.saveFirst('st');
+  var f = ee.Filter.equals({leftField:'month', rightField:'month'});
+  var jIC = ee.ImageCollection(j.apply(ic, stats, f));
+  return jIC.map(function(img){
+    var st   = ee.Image(img.get('st'));
+    var mean = st.select('mean');
+    var std  = st.select('std');
+    var z    = ee.Image(img).select('accK').subtract(mean).divide(std).rename(outName);
+    return z.copyProperties(img, ['system:time_start','year','month','idx']);
+  });
+}
+
+var SPI_mon  = standardize(Pk,  statsP,  'SPI');   // monthly SPI-3
+var SPEI_mon = standardize(WBk, statsWB, 'SPEI');  // monthly SPEI-3
+
+/* annual means, baseline & anomaly */
+function annualMean(ic, band){
+  var years = ee.List.sequence(startYear, endYear);
+  return ee.ImageCollection(years.map(function(y){
+    var sub = ic.filter(ee.Filter.eq('year', y));
+    var mean = sub.select(band).mean().rename(band + '_annual');
+    return mean.set('year', y);
+  }));
+}
+
+var SPI_y   = annualMean(SPI_mon,  'SPI');
+var SPEI_y  = annualMean(SPEI_mon, 'SPEI');
+
+// baseline (1980–2010) & recent (2011–2024) means
+var SPI_base   = SPI_y.filter(ee.Filter.lte('year', baseEnd)).select('SPI_annual').mean().rename('SPI_base');
+var SPEI_base  = SPEI_y.filter(ee.Filter.lte('year', baseEnd)).select('SPEI_annual').mean().rename('SPEI_base');
+
+var SPI_recent  = SPI_y.filter(ee.Filter.gte('year', baseEnd+1)).select('SPI_annual').mean().rename('SPI_recent');
+var SPEI_recent = SPEI_y.filter(ee.Filter.gte('year', baseEnd+1)).select('SPEI_annual').mean().rename('SPEI_recent');
+
+// anomaly = recent − baseline
+var SPI_anom   = SPI_recent.subtract(SPI_base).rename('SPI_anom').clip(region);
+var SPEI_anom  = SPEI_recent.subtract(SPEI_base).rename('SPEI_anom').clip(region);
+
+// clip baseline maps too
+SPI_base  = SPI_base.clip(region);
+SPEI_base = SPEI_base.clip(region);
+
+/*review*/
+Map.centerObject(region, 7);
+Map.addLayer(SPI_base,  {min:-1, max:1, palette:['#7fcdbb','#ffffbf','#fc8d59']}, 'SPI-3 baseline (1980–2010)');
+Map.addLayer(SPI_anom,  {min:-1, max:1, palette:['#2c7fb8','#ffffbf','#d7301f']}, 'SPI-3 anomaly (2011–2024)');
+Map.addLayer(SPEI_base, {min:-1, max:1, palette:['#7fcdbb','#ffffbf','#fc8d59']}, 'SPEI-3 baseline (1980–2010)');
+Map.addLayer(SPEI_anom, {min:-1, max:1, palette:['#2c7fb8','#ffffbf','#d7301f']}, 'SPEI-3 anomaly (2011–2024)');
+
+/*  4 GeoTIFF*/
+Export.image.toDrive({
+  image: SPI_base, description: 'SPI3_baseline_1980_2010',
+  folder: driveFolder, fileNamePrefix: 'SPI3_baseline_1980_2010',
+  region: region, scale: exportScale, maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: SPI_anom, description: 'SPI3_anomaly_2011_2024_minus_1980_2010',
+  folder: driveFolder, fileNamePrefix: 'SPI3_anomaly_2011_2024_minus_1980_2010',
+  region: region, scale: exportScale, maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: SPEI_base, description: 'SPEI3_baseline_1980_2010',
+  folder: driveFolder, fileNamePrefix: 'SPEI3_baseline_1980_2010',
+  region: region, scale: exportScale, maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: SPEI_anom, description: 'SPEI3_anomaly_2011_2024_minus_1980_2010',
+  folder: driveFolder, fileNamePrefix: 'SPEI3_anomaly_2011_2024_minus_1980_2010',
+  region: region, scale: exportScale, maxPixels: 1e13
+});
